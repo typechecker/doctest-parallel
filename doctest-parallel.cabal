@@ -87,6 +87,7 @@ library
       Paths_doctest_parallel
   build-depends:
       Cabal
+    , Cabal-syntax
     , Glob
     , base >=4.10 && <5
     , base-compat >=0.7.0

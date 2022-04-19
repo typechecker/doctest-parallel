@@ -3,9 +3,19 @@
 {-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE RankNTypes #-}
+
+{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DeriveFoldable #-}
+{-# LANGUAGE DeriveTraversable #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Test.DocTest.Helpers where
 
+import Debug.Trace
+import Data.List
 import GHC.Stack (HasCallStack)
 
 import System.Directory
@@ -24,12 +34,15 @@ import Distribution.ModuleName (ModuleName)
 import Distribution.Simple
   ( Extension (DisableExtension, EnableExtension, UnknownExtension) )
 import Distribution.Types.UnqualComponentName ( unUnqualComponentName )
-import Distribution.PackageDescription
-  ( CondTree(CondNode, condTreeData), GenericPackageDescription (condLibrary)
-  , exposedModules, libBuildInfo, hsSourceDirs, defaultExtensions, package
-  , packageDescription, condSubLibraries, includeDirs, autogenModules )
+import Distribution.PackageDescription hiding (Library)
+  -- ( CondTree(..), GenericPackageDescription (..)
+  -- , exposedModules, libBuildInfo, hsSourceDirs, defaultExtensions, package
+  -- , packageDescription, condSubLibraries, includeDirs, autogenModules )
 
+import Distribution.Fields.Pretty
 import Distribution.Pretty (prettyShow)
+import Distribution.PackageDescription.PrettyPrint
+import Distribution.CabalSpecVersion (cabalSpecLatest)
 import Distribution.Verbosity (silent)
 
 #if MIN_VERSION_Cabal(3,6,0)
@@ -38,6 +51,10 @@ import Distribution.Utils.Path (SourceDir, PackageDir, SymbolicPath)
 
 -- cabal-install-parsers
 import Distribution.PackageDescription.Parsec (readGenericPackageDescription)
+
+import qualified Data.Map as Map
+import Distribution.PackageDescription.Check (PackageCheck(..))
+import Distribution.Types.CondTree
 
 -- | Efficient implementation of set like deletion on lists
 --
@@ -138,6 +155,7 @@ compatPrettyShow = id
 extractSpecificCabalLibrary :: Maybe String -> FilePath -> IO Library
 extractSpecificCabalLibrary maybeLibName pkgPath = do
   pkg <- readGenericPackageDescription silent pkgPath
+  -- _ <- print $ showFields (const []) $ ppGenericPackageDescription cabalSpecLatest pkg
   case maybeLibName of
     Nothing ->
       case condLibrary pkg of
@@ -158,17 +176,20 @@ extractSpecificCabalLibrary maybeLibName pkgPath = do
     | unUnqualComponentName libName == targetLibName = lib
     | otherwise = findSubLib pkg targetLibName libs
 
-  go CondNode{condTreeData=lib} =
+  go xx@CondNode{condTreeData=lib} =
     let
-      buildInfo = libBuildInfo lib
+      -- buildInfo = libBuildInfo lib
+      buildInfo = libBuildInfo (fst $ ignoreConditions xx)
       sourceDirs = hsSourceDirs buildInfo
       cSourceDirs = includeDirs buildInfo
       root = takeDirectory pkgPath
     in
+      traceShow xx $
       pure Library
         { libSourceDirectories = map ((root </>) . compatPrettyShow) sourceDirs
         , libCSourceDirectories = map (root </>) cSourceDirs
         , libModules = exposedModules lib `rmList` autogenModules buildInfo
+        -- , libDefaultExtensions = defaultExtensions $ trace ("BUILD-INFO: " ++ show buildInfo) buildInfo
         , libDefaultExtensions = defaultExtensions buildInfo
         }
 
@@ -177,3 +198,40 @@ extractSpecificCabalLibrary maybeLibName pkgPath = do
 -- and error if no library was specified in the cabal package file.
 extractCabalLibrary :: FilePath -> IO Library
 extractCabalLibrary = extractSpecificCabalLibrary Nothing
+
+checkDuplicateModules :: GenericPackageDescription -> [PackageCheck]
+checkDuplicateModules pkg =
+       concatMap checkLib   (maybe id (:) (condLibrary pkg) . map snd $ condSubLibraries pkg)
+  where
+    -- the duplicate modules check is has not been thoroughly vetted for backpack
+    checkLib   = checkDups "library" (\l -> explicitLibModules l ++ map moduleReexportName (reexportedModules l))
+    checkDups s getModules t =
+               let sumPair (x,x') (y,y') = (x + x' :: Int, y + y' :: Int)
+                   mergePair (x, x') (y, y') = (x + x', max y y')
+                   maxPair (x, x') (y, y') = (max x x', max y y')
+                   libMap = foldCondTree Map.empty
+                                         (\(_,v) -> Map.fromListWith sumPair . map (\x -> (x,(1, 1))) $ getModules v )
+                                         (Map.unionWith mergePair) -- if a module may occur in nonexclusive branches count it twice strictly and once loosely.
+                                         (Map.unionWith maxPair) -- a module occurs the max of times it might appear in exclusive branches
+                                         t
+                   dupLibsStrict = Map.keys $ Map.filter ((>1) . fst) libMap
+                   dupLibsLax = Map.keys $ Map.filter ((>1) . snd) libMap
+               in if not (null dupLibsLax)
+                      then [PackageBuildImpossible $ "Duplicate modules in " ++ s ++ ": " ++ commaSep (map prettyShow dupLibsLax)]
+                      else if not (null dupLibsStrict)
+                           then [PackageDistSuspicious $ "Potential duplicate modules (subject to conditionals) in " ++ s ++ ": " ++ commaSep (map prettyShow dupLibsStrict)]
+                           else []
+
+                           -- | Flatten a CondTree. This will traverse the CondTree by taking all
+--  possible paths into account, but merging inclusive when two paths
+--  may co-exist, and exclusively when the paths are an if/else
+foldCondTree :: forall b c a v. b -> ((c, a) -> b) -> (b -> b -> b) -> (b -> b -> b) -> CondTree v c a -> b
+foldCondTree e u mergeInclusive mergeExclusive = goTree
+  where
+    goTree :: CondTree v c a -> b
+    goTree (CondNode a c ifs) = u (c, a) `mergeInclusive` foldl goBranch e ifs
+    goBranch :: b -> CondBranch v c a -> b
+    goBranch acc (CondBranch _ t mt) = mergeInclusive acc (maybe (goTree t) (mergeExclusive (goTree t) . goTree) mt)
+
+commaSep :: [String] -> String
+commaSep = intercalate ", "
